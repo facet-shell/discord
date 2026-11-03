@@ -17,7 +17,7 @@
 
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
-import { sendMessage } from "@utils/discord";
+import { insertTextIntoChatInputBox, sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
 import { ChannelStore, GuildStore, Menu, MessageStore, NavigationRouter, React, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
@@ -62,6 +62,26 @@ const AudioActions = findByPropsLazy("toggleSelfMute", "toggleSelfDeaf");
 const CallActions = findByPropsLazy("stopRinging", "ring");
 
 let commandPoll: ReturnType<typeof setInterval> | undefined;
+
+// Ctrl+Alt+Q types an @ and Ctrl+Alt+E a € on the desktop. Hyprland sends other apps AltGr+key,
+// which Chromium on Wayland turns into nothing, so Hyprland passes Ctrl+Alt+key to Vesktop and
+// the character is typed here.
+const altGrKeys: Record<string, string> = { KeyQ: "@", KeyE: "€" };
+
+function typeAltGr(e: KeyboardEvent) {
+    const char = altGrKeys[e.code];
+    if (!char || !e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey)
+        return;
+    e.preventDefault();
+    e.stopPropagation();
+    // Discord's message box (Slate) ignores execCommand, it takes text through its own dispatch;
+    // plain fields (search, settings) still do with execCommand
+    if ((document.activeElement as HTMLElement | null)?.getAttribute("role") === "textbox")
+        insertTextIntoChatInputBox(char);
+    else
+        document.execCommand("insertText", false, char);
+}
+
 // Calls we already told the shell about, so CALL_UPDATE does not repeat them
 const ringingCalls = new Map<string, { caller: string; avatar: string }>();
 // Calls declined from the shell; anything else that stops ringing without you joining is missed
@@ -122,6 +142,11 @@ function sendSelfState() {
         deafened: MediaEngineStore.isSelfDeaf(),
         channel: voice ? channelName(voice) : ""
     });
+}
+
+// Discord used to send the rung users as `ringing` (ids); now it sends `ongoingRings`, keyed by id
+function ringingUsers(ringing: string[] | undefined, ongoingRings: Record<string, unknown> | undefined): string[] {
+    return ringing ?? Object.keys(ongoingRings ?? {});
 }
 
 function handleCall(channelId: string, ringing: string[] | undefined) {
@@ -459,12 +484,12 @@ export default definePlugin({
             });
         },
 
-        CALL_CREATE({ channelId, ringing }: any) {
-            handleCall(channelId, ringing);
+        CALL_CREATE({ channelId, ringing, ongoingRings }: any) {
+            handleCall(channelId, ringingUsers(ringing, ongoingRings));
         },
 
-        CALL_UPDATE({ channelId, ringing }: any) {
-            handleCall(channelId, ringing);
+        CALL_UPDATE({ channelId, ringing, ongoingRings }: any) {
+            handleCall(channelId, ringingUsers(ringing, ongoingRings));
         },
 
         // The caller hung up before anyone answered
@@ -484,6 +509,7 @@ export default definePlugin({
 
     start() {
         Native.connect();
+        window.addEventListener("keydown", typeAltGr, true);
         // The native side cannot call into the renderer, so pick up commands here
         commandPoll = setInterval(async () => {
             for (const command of await Native.takeCommands())
@@ -493,6 +519,7 @@ export default definePlugin({
 
     stop() {
         clearInterval(commandPoll);
+        window.removeEventListener("keydown", typeAltGr, true);
         ringingCalls.clear();
         declinedCalls.clear();
         Native.disconnect();
