@@ -167,8 +167,17 @@ let lastDm: { userId: string; name: string; channelId: string } | null = null;
 type LastMessage = { author: string; content: string; mine: boolean; time: number };
 const lastMessages = new Map<string, LastMessage>();
 
+// A call posts an empty system message (type 3) into the DM; the launcher shows it as "(call)"
 function messageText(message: any): string {
-    return message?.content || (message?.attachments?.length ? "(attachment)" : message?.embeds?.length ? "(embed)" : message?.sticker_items?.length || message?.stickerItems?.length ? "(sticker)" : "");
+    return message?.content || (message?.attachments?.length ? "(attachment)" : message?.embeds?.length ? "(embed)" : message?.sticker_items?.length || message?.stickerItems?.length ? "(sticker)" : message?.type === 3 ? "(call)" : "");
+}
+
+// Message types someone actually wrote: default, reply, slash command and context menu command.
+// The rest are system messages (call started, member added, channel renamed, pinned, ...).
+const USER_MESSAGE_TYPES = new Set([0, 19, 20, 23]);
+
+function isUserMessage(message: any): boolean {
+    return USER_MESSAGE_TYPES.has(message?.type ?? 0);
 }
 
 function snowflakeTime(id: string | null | undefined): number {
@@ -372,9 +381,15 @@ export default definePlugin({
                 }
                 return;
             }
+            // A ringing call already notifies through CALL_CREATE; its system message would pop up a second time
+            if (!isUserMessage(message))
+                return;
             const isDm = channel?.isPrivate?.() ?? false;
             const mentioned = message.mention_everyone || (message.mentions ?? []).some((u: any) => u.id === me.id);
             if (!isDm && !mentioned)
+                return;
+            const content = messageText(message);
+            if (!content)
                 return;
             const guild = channel?.guild_id ? GuildStore.getGuild(channel.guild_id) : null;
             // A group DM has no guild and often no name, so without kind it looked like a DM
@@ -386,7 +401,7 @@ export default definePlugin({
                 channel: kind === "group" ? groupName(channel) : channel?.name ?? "",
                 guild: guild?.name ?? "",
                 mentioned,
-                content: message.content || "(attachment)",
+                content,
                 avatar: message.author.avatar
                     ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png?size=128`
                     : "",
