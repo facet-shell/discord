@@ -1,6 +1,6 @@
 # frameshell · discord
 
-Vesktop themed (based on system24) and the ShellBridge Vencord plugin: calls, DMs and voice joins in the shell, `d` in the launcher.
+Vesktop themed (based on system24) and the ShellBridge Vencord plugin: calls, DMs and voice joins in the shell, the voice overlay (who is in your channel and who talks), `d` in the launcher.
 
 Part of [frameshell](https://github.com/frame-shell); install it with the `frame` command:
 

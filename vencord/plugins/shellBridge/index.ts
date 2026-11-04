@@ -6,8 +6,9 @@
  *
  * Events: DMs and mentions, people joining/leaving your voice channel (and channels you
  * watch, see "Watch in shell" in a voice channel's right-click menu), scheduled server
- * events going live, incoming calls and how they ended (answered, declined, missed), your own mute/deafen changes.
- * Actions: accept/decline call, call back, join a watched channel, open channel, toggle mute/deafen,
+ * events going live, incoming calls and how they ended (answered, declined, missed), your own mute/deafen changes,
+ * and for the voice overlay who is in your channel and who is talking.
+ * Actions: accept/decline call, call back, join a watched channel, leave voice, open channel, toggle mute/deafen,
  * and for the launcher (d): list contacts, open a DM, call someone, send a DM, reply to the
  * last person you wrote to.
  *
@@ -20,7 +21,7 @@ import { definePluginSettings } from "@api/Settings";
 import { insertTextIntoChatInputBox, sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
-import { ChannelStore, GuildStore, Menu, MessageStore, NavigationRouter, React, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
+import { ChannelStore, GuildMemberStore, GuildStore, Menu, MessageStore, NavigationRouter, React, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.ShellBridge as PluginNative<typeof import("./native")>;
 
@@ -132,6 +133,52 @@ function channelName(channelId: string | null | undefined): string {
 
 function membersIn(channelId: string): number {
     return Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId) ?? {}).length;
+}
+
+// ── Voice overlay: who is in your channel and who is talking ─
+
+// Users whose microphone is open right now (SPEAKING), so the overlay can light them up
+const speaking = new Set<string>();
+
+// Everyone in your voice channel with their mute, deafen and stream state; an empty
+// channelId when you are in none. You come first, the rest by name.
+function voiceState() {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (!channelId)
+        return { type: "voice_state", channelId: "", channel: "", guild: "", members: [] };
+    const channel = ChannelStore.getChannel(channelId);
+    const guildId = channel?.guild_id ?? null;
+    const me = UserStore.getCurrentUser()?.id;
+    const states = Object.values<any>(VoiceStateStore.getVoiceStatesForChannel(channelId) ?? {});
+    const members = states.map(state => {
+        const user = UserStore.getUser(state.userId);
+        const you = state.userId === me;
+        return {
+            userId: state.userId,
+            name: (guildId && GuildMemberStore.getNick?.(guildId, state.userId)) || displayName(user),
+            avatar: asPng(user?.getAvatarURL?.(guildId ?? undefined, 64) ?? ""),
+            you,
+            // Your own state from the media engine: it changes before the voice state does
+            muted: you ? MediaEngineStore.isSelfMute() : !!(state.selfMute || state.mute),
+            deafened: you ? MediaEngineStore.isSelfDeaf() : !!(state.selfDeaf || state.deaf),
+            streaming: !!state.selfStream,
+            speaking: speaking.has(state.userId)
+        };
+    }).sort((a, b) => a.you !== b.you ? (a.you ? -1 : 1) : a.name.localeCompare(b.name));
+    return {
+        type: "voice_state",
+        channelId,
+        channel: channel?.type === 1 || channel?.type === 3 ? groupName(channel) : channel?.name ?? "call",
+        guild: guildId ? GuildStore.getGuild(guildId)?.name ?? "" : "",
+        members
+    };
+}
+
+// Several updates arrive at once when someone joins; one snapshot after them is enough
+let voiceTimer: ReturnType<typeof setTimeout> | undefined;
+function sendVoiceState() {
+    clearTimeout(voiceTimer);
+    voiceTimer = setTimeout(() => Native.send(voiceState()), 80);
 }
 
 function sendSelfState() {
@@ -368,6 +415,13 @@ function run(command: any) {
         case "toggle_deafen":
             AudioActions.toggleSelfDeaf();
             break;
+        // The shell (re)started and wants the overlay's state
+        case "voice_state":
+            Native.send(voiceState());
+            break;
+        case "leave_voice":
+            ChannelActions.selectVoiceChannel(null);
+            break;
     }
 }
 
@@ -439,6 +493,9 @@ export default definePlugin({
         VOICE_STATE_UPDATES({ voiceStates }: any) {
             const me = UserStore.getCurrentUser()?.id;
             const mine = SelectedChannelStore.getVoiceChannelId();
+            // The overlay: anything in your channel (or you moving) changes its list
+            if (voiceStates.some((s: any) => s.userId === me || (mine && (s.channelId === mine || s.oldChannelId === mine))))
+                sendVoiceState();
             const relevant = [mine, ...watchedChannels()].filter((id, i, all) => id && all.indexOf(id) === i) as string[];
             if (relevant.length === 0)
                 return;
@@ -500,10 +557,31 @@ export default definePlugin({
         // The store updates right after the event, so read it a moment later
         AUDIO_TOGGLE_SELF_MUTE() {
             setTimeout(sendSelfState, 50);
+            sendVoiceState();
         },
 
         AUDIO_TOGGLE_SELF_DEAF() {
             setTimeout(sendSelfState, 50);
+            sendVoiceState();
+        },
+
+        // You joined, left or switched a voice channel
+        VOICE_CHANNEL_SELECT() {
+            speaking.clear();
+            sendVoiceState();
+        },
+
+        // A microphone opens or closes (speakingFlags 0: quiet); only the change is sent,
+        // the overlay keeps the list
+        SPEAKING({ userId, speakingFlags }: any) {
+            const now = !!speakingFlags;
+            if (now === speaking.has(userId))
+                return;
+            if (now)
+                speaking.add(userId);
+            else
+                speaking.delete(userId);
+            Native.send({ type: "speaking", userId, speaking: now });
         }
     },
 
@@ -522,6 +600,8 @@ export default definePlugin({
         window.removeEventListener("keydown", typeAltGr, true);
         ringingCalls.clear();
         declinedCalls.clear();
+        speaking.clear();
+        clearTimeout(voiceTimer);
         Native.disconnect();
     }
 });
