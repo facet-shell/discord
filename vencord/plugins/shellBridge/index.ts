@@ -7,7 +7,7 @@
  * Events: DMs and mentions, people joining/leaving your voice channel (and channels you
  * watch, see "Watch in shell" in a voice channel's right-click menu), scheduled server
  * events going live, incoming calls and how they ended (answered, declined, missed), your own mute/deafen changes,
- * and for the voice overlay who is in your channel and who is talking.
+ * and for the voice overlay who is in your channel, who is talking and who watches your own stream.
  * Actions: accept/decline call, call back, join a watched channel, leave voice, open channel, toggle mute/deafen,
  * for the launcher (d): list contacts, open a DM, call someone, send a DM, reply to the
  * last person you wrote to, and for a notification's reply field: send into a channel.
@@ -58,6 +58,8 @@ const channelContextMenu: NavContextMenuPatchCallback = (children, { channel }: 
 
 const MediaEngineStore = findStoreLazy("MediaEngineStore");
 const VoiceStateStore = findStoreLazy("VoiceStateStore");
+// Go Live streams, yours included; only used behind try/catch (see streamState)
+const ApplicationStreamingStore = findStoreLazy("ApplicationStreamingStore");
 const ChannelActions = findByPropsLazy("selectVoiceChannel", "selectChannel");
 const AudioActions = findByPropsLazy("toggleSelfMute", "toggleSelfDeaf");
 const CallActions = findByPropsLazy("stopRinging", "ring");
@@ -179,6 +181,65 @@ let voiceTimer: ReturnType<typeof setTimeout> | undefined;
 function sendVoiceState() {
     clearTimeout(voiceTimer);
     voiceTimer = setTimeout(() => Native.send(voiceState()), 80);
+}
+
+// ── Voice overlay: who watches your own stream ──────────────
+
+// Discord keys a stream "guild:<guildId>:<channelId>:<ownerId>", a DM call "call:<channelId>:<ownerId>"
+function streamKey(stream: any): string {
+    return stream.guildId && stream.streamType !== "call"
+        ? `guild:${stream.guildId}:${stream.channelId}:${stream.ownerId}`
+        : `call:${stream.channelId}:${stream.ownerId}`;
+}
+
+// Warned once; afterwards the feature just stays off until Discord's names are checked
+let streamWarned = false;
+
+// Whether your Go Live stream runs and who watches it, sorted by name. Every store call is
+// guarded: ApplicationStreamingStore.getCurrentUserActiveStream() and getViewerIds() are
+// Discord internals, a rename makes this report "not live" instead of breaking the bridge.
+function streamState() {
+    const off = { type: "stream", live: false, viewers: [] as { id: string; name: string; avatar: string }[] };
+    try {
+        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
+        if (!stream)
+            return off;
+        // getViewerIds takes the stream object; should it want the key one day, try that too
+        let ids = ApplicationStreamingStore.getViewerIds?.(stream);
+        if (!Array.isArray(ids))
+            ids = ApplicationStreamingStore.getViewerIds?.(streamKey(stream));
+        const guildId = stream.guildId ?? null;
+        const viewers = (Array.isArray(ids) ? ids as string[] : []).map(id => {
+            const user = UserStore.getUser(id);
+            return {
+                id,
+                name: (guildId && GuildMemberStore.getNick?.(guildId, id)) || displayName(user),
+                avatar: asPng(user?.getAvatarURL?.(guildId ?? undefined, 64) ?? "")
+            };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        return { type: "stream", live: true, viewers };
+    } catch (e) {
+        if (!streamWarned)
+            console.warn("[ShellBridge] stream state unavailable, viewers stay off", e);
+        streamWarned = true;
+        return off;
+    }
+}
+
+// The store changes for every stream in every channel; only a change of your own state or
+// viewer list reaches the shell. lastStream = "" forces the next send (the shell reconnected).
+let lastStream = "";
+let streamTimer: ReturnType<typeof setTimeout> | undefined;
+function sendStreamState() {
+    clearTimeout(streamTimer);
+    streamTimer = setTimeout(() => {
+        const state = streamState();
+        const json = JSON.stringify(state);
+        if (json === lastStream)
+            return;
+        lastStream = json;
+        Native.send(state);
+    }, 80);
 }
 
 function sendSelfState() {
@@ -435,9 +496,11 @@ function run(command: any) {
         case "toggle_deafen":
             AudioActions.toggleSelfDeaf();
             break;
-        // The shell (re)started and wants the overlay's state
+        // The shell (re)started and wants the overlay's state, your stream's viewers included
         case "voice_state":
             Native.send(voiceState());
+            lastStream = "";
+            sendStreamState();
             break;
         case "leave_voice":
             ChannelActions.selectVoiceChannel(null);
@@ -585,10 +648,11 @@ export default definePlugin({
             sendVoiceState();
         },
 
-        // You joined, left or switched a voice channel
+        // You joined, left or switched a voice channel (leaving also ends your stream)
         VOICE_CHANNEL_SELECT() {
             speaking.clear();
             sendVoiceState();
+            sendStreamState();
         },
 
         // A microphone opens or closes (speakingFlags 0: quiet); only the change is sent,
@@ -608,6 +672,12 @@ export default definePlugin({
     start() {
         Native.connect();
         window.addEventListener("keydown", typeAltGr, true);
+        // Your stream starting, ending and its viewers coming and going all change this store
+        try {
+            ApplicationStreamingStore.addChangeListener(sendStreamState);
+        } catch (e) {
+            console.warn("[ShellBridge] no ApplicationStreamingStore, stream viewers stay off", e);
+        }
         // The native side cannot call into the renderer, so pick up commands here
         commandPoll = setInterval(async () => {
             for (const command of await Native.takeCommands())
@@ -622,6 +692,13 @@ export default definePlugin({
         declinedCalls.clear();
         speaking.clear();
         clearTimeout(voiceTimer);
+        clearTimeout(streamTimer);
+        lastStream = "";
+        try {
+            ApplicationStreamingStore.removeChangeListener(sendStreamState);
+        } catch {
+            // Never attached
+        }
         Native.disconnect();
     }
 });
