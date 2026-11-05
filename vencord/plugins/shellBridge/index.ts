@@ -9,8 +9,8 @@
  * events going live, incoming calls and how they ended (answered, declined, missed), your own mute/deafen changes,
  * and for the voice overlay who is in your channel and who is talking.
  * Actions: accept/decline call, call back, join a watched channel, leave voice, open channel, toggle mute/deafen,
- * and for the launcher (d): list contacts, open a DM, call someone, send a DM, reply to the
- * last person you wrote to.
+ * for the launcher (d): list contacts, open a DM, call someone, send a DM, reply to the
+ * last person you wrote to, and for a notification's reply field: send into a channel.
  *
  * Discord's internal module and event names change now and then; if something stops
  * working, check them first.
@@ -339,6 +339,23 @@ async function sendDm(userId: string, content: string, channelId?: string) {
     }
 }
 
+// Into a channel the shell got a message from (the reply field on a notification): a DM,
+// a group or a server channel. The shell shows "sent to …" from the answer.
+async function sendToChannel(channelId: string, content: string) {
+    const channel = ChannelStore.getChannel(channelId);
+    const to = channel?.type === 1 ? displayName(UserStore.getUser(channel.recipients?.[0]))
+        : channel?.type === 3 ? groupName(channel)
+        : channel?.name ? `#${channel.name}` : "channel";
+    try {
+        if (!channel)
+            throw new Error("channel not found");
+        await sendMessage(channelId, { content });
+        Native.send({ type: "sent", ok: true, to });
+    } catch (e) {
+        Native.send({ type: "sent", ok: false, to, error: String(e) });
+    }
+}
+
 // Straight to the DM channel; a friend without one gets a real 1:1 DM first. Vencord's
 // openPrivateChannel() hands Discord a bare user ID where it now wants { recipientIds },
 // which opened an empty group with only you in it.
@@ -385,6 +402,9 @@ function run(command: any) {
                 Native.send({ type: "sent", ok: false, to: "", error: "no DM to reply to yet" });
             break;
         }
+        case "send_message":
+            sendToChannel(String(command.channelId ?? ""), String(command.content ?? ""));
+            break;
         case "accept_call":
             focusWindow();
             ChannelActions.selectVoiceChannel(command.channelId);
