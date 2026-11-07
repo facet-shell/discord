@@ -3,7 +3,7 @@
  * @description facet tui ({{name}}) for Vencord/Vesktop, built on system24 (tui-style panels, monospace).
  * @author vxnsin
  * @version 1.0.0
- * @source https://github.com/vxnsin/frameshell
+ * @source https://github.com/vxnsin/facet
 */
 
 /* system24 by refact0r (MIT): https://github.com/refact0r/system24
@@ -163,9 +163,9 @@ body {
 /* Round what Discord draws round: profile pictures, server icons and folders, the badges
  * on them, the speaking ring and the push-to-talk dot in calls, the status dot, the round
  * buttons. system24's --unrounding squares every element with a four-class selector and
- * !important, which beats a plain selector; the body:not(#frameshell) in front only lifts
+ * !important, which beats a plain selector; the body:not(#facet) in front only lifts
  * these above it (nothing carries that id). */
-body:not(#frameshell) :is(
+body:not(#facet) :is(
     img[class*="avatar"],
     img[class*="Avatar"],
     [class*="userAvatar_"],
@@ -226,7 +226,7 @@ body:not(#frameshell) :is(
 }
 
 /* Ping and mention counters as pills, not boxes */
-body:not(#frameshell) :is(
+body:not(#facet) :is(
     [class*="numberBadge_"],
     [class*="lowerBadge_"] > div,
     [class*="upperBadge_"] > div,
