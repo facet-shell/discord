@@ -9,6 +9,7 @@
  * events going live, incoming calls and how they ended (answered, declined, missed), your own mute/deafen changes,
  * and for the voice overlay who is in your channel, who is talking and who watches your own stream.
  * Actions: accept/decline call, call back, join a watched channel, leave voice, open channel, toggle mute/deafen,
+ * start and stop your Go Live stream with the shell's settings (resolution, frame rate, which apps are heard),
  * for the launcher (d): list contacts, open a DM, call someone, send a DM, reply to the
  * last person you wrote to, and for a notification's reply field: send into a channel.
  *
@@ -18,9 +19,9 @@
 
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
-import { insertTextIntoChatInputBox, sendMessage } from "@utils/discord";
+import { getIntlMessage, insertTextIntoChatInputBox, sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { findByPropsLazy, findStoreLazy } from "@webpack";
+import { findByCode, findByProps, findByPropsLazy, findStoreLazy } from "@webpack";
 import { ChannelStore, GuildMemberStore, GuildStore, Menu, MessageStore, NavigationRouter, React, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.ShellBridge as PluginNative<typeof import("./native")>;
@@ -290,6 +291,268 @@ function endCall(channelId: string) {
     }, 400);
 }
 
+// ── Go Live from the shell ───────────────────────────────────
+//
+// The shell's stream panel picks resolution, frame rate and sound; this side sets up the
+// sound (Vesktop's venmic, as its own picker would), starts Discord's stream and answers
+// Vesktop's "Screen Share Picker" for you. The screen or window is still picked in the
+// desktop portal: Wayland gives apps no way around that.
+
+type StreamRequest = {
+    resolution?: string;
+    fps?: string;
+    // none: no sound; system: everything but `nodes`; apps: only `nodes`
+    audio?: "none" | "system" | "apps";
+    nodes?: Record<string, string>[];
+    hint?: "motion" | "detail";
+};
+
+// What the next Vesktop picker gets, and when it was asked for (a picker much later is
+// one you opened yourself, that one is left alone)
+let pendingStream: (StreamRequest & { at: number }) | null = null;
+let pickerWatch: MutationObserver | undefined;
+
+function vesktop(): any {
+    return (window as any).VesktopNative;
+}
+
+// Discord's internal stream actions: looked up when used, guarded, reported when missing
+function streamActions(): { start?: (...a: any[]) => any; stop?: (...a: any[]) => any; } {
+    const out: { start?: any; stop?: any; } = {};
+    try {
+        const mod = findByProps("startStream", "stopStream");
+        out.start = mod?.startStream;
+        out.stop = mod?.stopStream;
+    } catch { /* not under these names */ }
+    try {
+        out.start ??= findByCode('type:"STREAM_START"');
+    } catch { /* not found */ }
+    try {
+        out.stop ??= findByCode('type:"STREAM_STOP"');
+    } catch { /* not found */ }
+    return out;
+}
+
+// Each step of a stream start, into the shell's log (qs log), to see where one stops
+function streamStep(step: string) {
+    Native.send({ type: "stream_log", step });
+}
+
+function streamError(error: string) {
+    console.warn("[ShellBridge] stream:", error);
+    Native.send({ type: "stream_error", error });
+}
+
+// The apps that play sound right now, for the panel's lists
+async function sendAudioSources() {
+    try {
+        const answer = await vesktop()?.virtmic?.list();
+        if (!answer?.ok)
+            return Native.send({ type: "audio_sources", ok: false, list: [] });
+        const seen = new Set<string>();
+        const list = (answer.targets ?? []).flatMap((node: Record<string, string>) => {
+            const name = node["application.name"] || node["node.name"] || "";
+            if (!name || seen.has(name))
+                return [];
+            seen.add(name);
+            return [{ name, node }];
+        }).sort((a: any, b: any) => a.name.localeCompare(b.name));
+        Native.send({ type: "audio_sources", ok: true, list });
+    } catch (e) {
+        Native.send({ type: "audio_sources", ok: false, list: [], error: String(e) });
+    }
+}
+
+// Resolution and frame rate on the running stream, the way Vesktop's picker applies them
+function applyQuality(request: StreamRequest) {
+    const fps = Number(request.fps ?? 30);
+    const height = Number(request.resolution ?? 720);
+    const width = Math.round(height * 16 / 9);
+    const me = UserStore.getCurrentUser()?.id;
+    try {
+        const conn = [...MediaEngineStore.getMediaEngine().connections].find((c: any) => c.streamUserId === me) as any;
+        if (!conn)
+            return false;
+        const params = conn.videoStreamParameters?.[0];
+        if (params) {
+            params.maxFrameRate = fps;
+            params.maxResolution ??= { width: 0, height: 0 };
+            params.maxResolution.width = width;
+            params.maxResolution.height = height;
+        }
+        const track = conn.input?.stream?.getVideoTracks?.()[0];
+        if (track) {
+            track.contentHint = request.hint ?? "motion";
+            track.applyConstraints({
+                ...track.getConstraints(),
+                frameRate: { min: fps, ideal: fps },
+                width: { min: 640, ideal: width, max: width },
+                height: { min: 480, ideal: height, max: height },
+                advanced: [{ width, height }],
+                resizeMode: "none"
+            }).catch((e: unknown) => console.warn("[ShellBridge] constraints", e));
+        }
+        return true;
+    } catch (e) {
+        console.warn("[ShellBridge] stream quality", e);
+        return false;
+    }
+}
+
+// Vesktop's picker (a Discord modal): pick the resolution and frame rate there too, so its
+// own Go Live uses them, then press Go Live
+function answerPicker(root: HTMLElement) {
+    const request = pendingStream;
+    if (!request || Date.now() - request.at > 60000)
+        return false;
+    const modal = [...root.querySelectorAll<HTMLElement>("[role=dialog]")]
+        .find(d => /Screen Share Picker/i.test(d.textContent ?? ""));
+    if (!modal)
+        return false;
+    pendingStream = null;
+    streamStep("Vesktop's picker is open, filling it in");
+    // Vesktop's picker (ScreenSharePicker.tsx): three sections .vcd-screen-picker-quality-section
+    // (Resolution, Frame Rate, Content Type), each a row of <label> with a radio <input value>.
+    // Every radio is named "fps", so they are found by section and value, never by text.
+    const sections = [...modal.querySelectorAll<HTMLElement>("[class*='vcd-screen-picker-quality-section']")];
+    const choose = (section: HTMLElement | undefined, value: string | undefined, what: string) => {
+        if (!value)
+            return;
+        const input = section?.querySelector<HTMLInputElement>(`input[type=radio][value="${CSS.escape(value)}"]`);
+        if (!input) {
+            streamStep(`${what} ${value} not found in Vesktop's picker`);
+            return;
+        }
+        if (!input.checked)
+            (input.closest("label") ?? input).click();
+    };
+    choose(sections[0], request.resolution, "resolution");
+    choose(sections[1], request.fps, "frame rate");
+    choose(sections[2], request.hint ?? "motion", "content type");
+    streamStep(`picked ${request.resolution}p, ${request.fps} fps, ${request.hint ?? "motion"} (${sections.length} sections)`);
+    setTimeout(() => {
+        const live = [...modal.querySelectorAll<HTMLButtonElement>("button")]
+            .find(b => /go live/i.test(b.textContent ?? ""));
+        if (live) {
+            live.click();
+            streamStep("pressed Go Live in Vesktop's picker");
+        }
+        else
+            streamError("Vesktop's picker has no Go Live button, finish it there");
+        // Once the stream runs, set the quality on it as well
+        for (const wait of [800, 2500])
+            setTimeout(() => applyQuality(request), wait);
+    }, 150);
+    return true;
+}
+
+function watchPicker() {
+    pickerWatch?.disconnect();
+    pickerWatch = new MutationObserver(() => {
+        if (answerPicker(document.body)) {
+            pickerWatch?.disconnect();
+            pickerWatch = undefined;
+        }
+    });
+    pickerWatch.observe(document.body, { childList: true, subtree: true });
+    // Nobody picked anything in the portal within a minute: stop looking
+    setTimeout(() => {
+        pickerWatch?.disconnect();
+        pickerWatch = undefined;
+        pendingStream = null;
+    }, 60000);
+}
+
+// Discord's own "Share Your Screen" button in the voice panel: the web client starts a
+// stream from there (browser picker first), its action creators alone do not. Found by its
+// translated label, so it works in any language.
+function shareScreenButton(): HTMLElement | null {
+    const labels = new Set<string>(["Share Your Screen", "Share Screen", "Bildschirm teilen", "Deinen Bildschirm teilen"]);
+    for (const key of ["SHARE_YOUR_SCREEN", "SHARE_SCREEN", "GO_LIVE_SHARE_SCREEN"]) {
+        try {
+            const text = getIntlMessage(key);
+            if (typeof text === "string" && text)
+                labels.add(text);
+        } catch { /* key unknown */ }
+    }
+    const buttons = [...document.querySelectorAll<HTMLElement>("button[aria-label], [role=button][aria-label]")];
+    return buttons.find(b => labels.has(b.getAttribute("aria-label") ?? "")) ?? null;
+}
+
+// venmic only hears the default output unless told otherwise; with a GoXLR (or any setup
+// with several outputs) the apps play elsewhere, so let it hear all speakers
+function hearAllOutputs() {
+    try {
+        const settings = vesktop()?.settings?.get?.();
+        if (settings && settings.audio?.onlyDefaultSpeakers !== false)
+            // set() takes the whole settings object (it replaces the store) plus the changed path
+            vesktop().settings.set({ ...settings, audio: { ...(settings.audio ?? {}), onlyDefaultSpeakers: false } }, "audio");
+    } catch (e) {
+        console.warn("[ShellBridge] audio settings", e);
+    }
+}
+
+async function startStream(request: StreamRequest) {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (!channelId)
+        return streamError("Join a voice channel first");
+    const channel = ChannelStore.getChannel(channelId);
+    hearAllOutputs();
+
+    // Sound first: the stream picks up Vesktop's "vencord-screen-share" device when it is there
+    try {
+        const nodes = request.nodes ?? [];
+        await vesktop()?.virtmic?.stop?.();
+        if (request.audio === "system")
+            await vesktop()?.virtmic?.startSystem(nodes);
+        else if (request.audio === "apps" && nodes.length > 0)
+            await vesktop()?.virtmic?.start(nodes);
+        streamStep(`sound set up: ${request.audio}, ${nodes.length} app(s)`);
+    } catch (e) {
+        streamError(`Sound could not be set up: ${e}`);
+    }
+
+    pendingStream = { ...request, at: Date.now() };
+    watchPicker();
+    // The button lives in the channel's call view; from elsewhere (the friends list) open
+    // the channel first and wait for it. Discord's stream action alone gives a black stream.
+    let button = shareScreenButton();
+    if (!button) {
+        streamStep("no share button here, opening the voice channel");
+        NavigationRouter.transitionTo(`/channels/${channel?.guild_id ?? "@me"}/${channelId}`);
+        for (let i = 0; i < 30 && !button; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            button = shareScreenButton();
+        }
+    }
+    if (!button) {
+        pendingStream = null;
+        pickerWatch?.disconnect();
+        const seen = [...document.querySelectorAll<HTMLElement>("button[aria-label], [role=button][aria-label]")]
+            .map(b => b.getAttribute("aria-label") ?? "")
+            .filter(l => /screen|bildschirm|stream|live|übertrag/i.test(l));
+        streamStep(`share buttons seen: ${JSON.stringify(seen)}`);
+        return streamError("Discord's Share Your Screen button was not found");
+    }
+    streamStep(`pressing Discord's "${button.getAttribute("aria-label")}" button`);
+    button.click();
+}
+
+function stopStream() {
+    streamStep("stopping the stream");
+    try {
+        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
+        if (!stream)
+            return;
+        const { stop } = streamActions();
+        if (!stop)
+            return streamError("Discord's stream stop was not found");
+        stop(streamKey(stream));
+    } catch (e) {
+        streamError(`Stopping the stream failed: ${e}`);
+    }
+}
+
 // ── Launcher (d): contacts and direct messages ───────────────
 
 // The DM you last wrote in, for "d reply"; unknown until you write one after Discord started
@@ -505,6 +768,19 @@ function run(command: any) {
         case "leave_voice":
             ChannelActions.selectVoiceChannel(null);
             break;
+        case "audio_sources":
+            sendAudioSources();
+            break;
+        case "start_stream":
+            startStream(command as StreamRequest);
+            break;
+        case "stop_stream":
+            stopStream();
+            break;
+        case "stream_quality":
+            if (!applyQuality(command as StreamRequest))
+                streamError("No running stream to change");
+            break;
     }
 }
 
@@ -693,6 +969,8 @@ export default definePlugin({
         speaking.clear();
         clearTimeout(voiceTimer);
         clearTimeout(streamTimer);
+        pickerWatch?.disconnect();
+        pendingStream = null;
         lastStream = "";
         try {
             ApplicationStreamingStore.removeChangeListener(sendStreamState);
