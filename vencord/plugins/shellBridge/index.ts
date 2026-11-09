@@ -291,24 +291,14 @@ function endCall(channelId: string) {
     }, 400);
 }
 
-// ── Go Live from the shell ───────────────────────────────────
-//
-// The shell's stream panel picks resolution, frame rate and sound; this side sets up the
-// sound (Vesktop's venmic, as its own picker would), starts Discord's stream and answers
-// Vesktop's "Screen Share Picker" for you. The screen or window is still picked in the
-// desktop portal: Wayland gives apps no way around that.
-
 type StreamRequest = {
     resolution?: string;
     fps?: string;
-    // none: no sound; system: everything but `nodes`; apps: only `nodes`
     audio?: "none" | "system" | "apps";
     nodes?: Record<string, string>[];
     hint?: "motion" | "detail";
 };
 
-// What the next Vesktop picker gets, and when it was asked for (a picker much later is
-// one you opened yourself, that one is left alone)
 let pendingStream: (StreamRequest & { at: number }) | null = null;
 let pickerWatch: MutationObserver | undefined;
 
@@ -316,7 +306,6 @@ function vesktop(): any {
     return (window as any).VesktopNative;
 }
 
-// Discord's internal stream actions: looked up when used, guarded, reported when missing
 function streamActions(): { start?: (...a: any[]) => any; stop?: (...a: any[]) => any; } {
     const out: { start?: any; stop?: any; } = {};
     try {
@@ -333,7 +322,6 @@ function streamActions(): { start?: (...a: any[]) => any; stop?: (...a: any[]) =
     return out;
 }
 
-// Each step of a stream start, into the shell's log (qs log), to see where one stops
 function streamStep(step: string) {
     Native.send({ type: "stream_log", step });
 }
@@ -343,7 +331,6 @@ function streamError(error: string) {
     Native.send({ type: "stream_error", error });
 }
 
-// The apps that play sound right now, for the panel's lists
 async function sendAudioSources() {
     try {
         const answer = await vesktop()?.virtmic?.list();
@@ -363,7 +350,6 @@ async function sendAudioSources() {
     }
 }
 
-// Resolution and frame rate on the running stream, the way Vesktop's picker applies them
 function applyQuality(request: StreamRequest) {
     const fps = Number(request.fps ?? 30);
     const height = Number(request.resolution ?? 720);
@@ -399,8 +385,6 @@ function applyQuality(request: StreamRequest) {
     }
 }
 
-// Vesktop's picker (a Discord modal): pick the resolution and frame rate there too, so its
-// own Go Live uses them, then press Go Live
 function answerPicker(root: HTMLElement) {
     const request = pendingStream;
     if (!request || Date.now() - request.at > 60000)
@@ -411,9 +395,7 @@ function answerPicker(root: HTMLElement) {
         return false;
     pendingStream = null;
     streamStep("Vesktop's picker is open, filling it in");
-    // Vesktop's picker (ScreenSharePicker.tsx): three sections .vcd-screen-picker-quality-section
-    // (Resolution, Frame Rate, Content Type), each a row of <label> with a radio <input value>.
-    // Every radio is named "fps", so they are found by section and value, never by text.
+    // Every radio is named "fps": find them by section and value, never by text.
     const sections = [...modal.querySelectorAll<HTMLElement>("[class*='vcd-screen-picker-quality-section']")];
     const choose = (section: HTMLElement | undefined, value: string | undefined, what: string) => {
         if (!value)
@@ -439,7 +421,6 @@ function answerPicker(root: HTMLElement) {
         }
         else
             streamError("Vesktop's picker has no Go Live button, finish it there");
-        // Once the stream runs, set the quality on it as well
         for (const wait of [800, 2500])
             setTimeout(() => applyQuality(request), wait);
     }, 150);
@@ -455,7 +436,6 @@ function watchPicker() {
         }
     });
     pickerWatch.observe(document.body, { childList: true, subtree: true });
-    // Nobody picked anything in the portal within a minute: stop looking
     setTimeout(() => {
         pickerWatch?.disconnect();
         pickerWatch = undefined;
@@ -463,9 +443,6 @@ function watchPicker() {
     }, 60000);
 }
 
-// Discord's own "Share Your Screen" button in the voice panel: the web client starts a
-// stream from there (browser picker first), its action creators alone do not. Found by its
-// translated label, so it works in any language.
 function shareScreenButton(): HTMLElement | null {
     const labels = new Set<string>(["Share Your Screen", "Share Screen", "Bildschirm teilen", "Deinen Bildschirm teilen"]);
     for (const key of ["SHARE_YOUR_SCREEN", "SHARE_SCREEN", "GO_LIVE_SHARE_SCREEN"]) {
@@ -479,13 +456,12 @@ function shareScreenButton(): HTMLElement | null {
     return buttons.find(b => labels.has(b.getAttribute("aria-label") ?? "")) ?? null;
 }
 
-// venmic only hears the default output unless told otherwise; with a GoXLR (or any setup
-// with several outputs) the apps play elsewhere, so let it hear all speakers
+// venmic only hears the default output unless told otherwise
 function hearAllOutputs() {
     try {
         const settings = vesktop()?.settings?.get?.();
         if (settings && settings.audio?.onlyDefaultSpeakers !== false)
-            // set() takes the whole settings object (it replaces the store) plus the changed path
+            // set() replaces the whole store, so pass all of it plus the changed path
             vesktop().settings.set({ ...settings, audio: { ...(settings.audio ?? {}), onlyDefaultSpeakers: false } }, "audio");
     } catch (e) {
         console.warn("[ShellBridge] audio settings", e);
@@ -499,7 +475,6 @@ async function startStream(request: StreamRequest) {
     const channel = ChannelStore.getChannel(channelId);
     hearAllOutputs();
 
-    // Sound first: the stream picks up Vesktop's "vencord-screen-share" device when it is there
     try {
         const nodes = request.nodes ?? [];
         await vesktop()?.virtmic?.stop?.();
@@ -514,8 +489,7 @@ async function startStream(request: StreamRequest) {
 
     pendingStream = { ...request, at: Date.now() };
     watchPicker();
-    // The button lives in the channel's call view; from elsewhere (the friends list) open
-    // the channel first and wait for it. Discord's stream action alone gives a black stream.
+    // Discord's stream action alone gives a black stream, so press the real button
     let button = shareScreenButton();
     if (!button) {
         streamStep("no share button here, opening the voice channel");
